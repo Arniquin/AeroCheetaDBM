@@ -34,10 +34,6 @@
     "externalBin": [],
     "resources": [],
     "windows": {
-      "nsis": {
-        "installerIcon": "icons/icon.ico",
-        "installerMode": "portable"
-      }
     }
   }
 }
