@@ -1,0 +1,19 @@
+[[permission]]
+identifier = "allow-test-connection"
+description = "Allows testing database connections"
+commands.allow = ["test_connection"]
+
+[[permission]]
+identifier = "allow-execute-query"
+description = "Allows executing database queries"
+commands.allow = ["execute_query"]
+
+[[permission]]
+identifier = "allow-get-tables"
+description = "Allows fetching table list"
+commands.allow = ["get_tables"]
+
+[[permission]]
+identifier = "allow-get-columns"
+description = "Allows fetching column list"
+commands.allow = ["get_columns"]
