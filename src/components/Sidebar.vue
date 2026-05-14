@@ -47,7 +47,8 @@ function openNewConnectionForm() {
     port: 5432,
     user: '',
     password: '',
-    database: ''
+    database: '',
+    use_entra_id: false
   };
   useConnectionString.value = false;
   connString.value = '';
@@ -248,13 +249,20 @@ function getStatusColor(status: string) {
             <input v-model.number="newConn.port" type="number" />
           </div>
 
+          <div class="field" v-if="newConn.db_type === 'sqlserver'">
+            <div class="checkbox-field">
+              <input type="checkbox" v-model="newConn.use_entra_id" id="use-entra" />
+              <label for="use-entra">Use Microsoft Entra ID (Integrated)</label>
+            </div>
+          </div>
+
           <div class="field">
             <label>User</label>
-            <input v-model="newConn.user" placeholder="username" />
+            <input v-model="newConn.user" placeholder="username" :disabled="newConn.use_entra_id" />
           </div>
           <div class="field">
             <label>Password</label>
-            <input v-model="newConn.password" type="password" placeholder="••••••••" />
+            <input v-model="newConn.password" type="password" placeholder="••••••••" :disabled="newConn.use_entra_id" />
           </div>
           <div class="field">
             <label>Database Name</label>

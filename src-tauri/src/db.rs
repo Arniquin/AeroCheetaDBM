@@ -1,11 +1,13 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, Column};
 use mongodb::{Client, bson::{Document, doc}};
-use tiberius::{Client as TiberiusClient, Config};
+use tiberius::{Client as TiberiusClient, Config, AuthMethod};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use std::time::Instant;
 use futures::StreamExt;
+use azure_identity::DefaultAzureCredential;
+use azure_core::auth::TokenCredential;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub enum DbType {
@@ -29,6 +31,7 @@ pub struct ConnectionInfo {
     pub user: Option<String>,
     pub password: Option<String>,
     pub database: Option<String>,
+    pub use_entra_id: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,22 +65,44 @@ impl ConnectionWrapper {
         match self {
             ConnectionWrapper::Info(info) => Ok(info.clone()),
             ConnectionWrapper::String(s) => {
-                // Simplified parser for demo purposes. 
-                // A real app should use a robust URL parser or handle it based on prefix.
                 if s.starts_with("postgres://") {
-                    Ok(ConnectionInfo { db_type: DbType::Postgres, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()) })
+                    Ok(ConnectionInfo { db_type: DbType::Postgres, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None })
                 } else if s.starts_with("mysql://") {
-                    Ok(ConnectionInfo { db_type: DbType::Mysql, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()) })
+                    Ok(ConnectionInfo { db_type: DbType::Mysql, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None })
                 } else if s.starts_with("mongodb://") {
-                    Ok(ConnectionInfo { db_type: DbType::Mongodb, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()) })
-                } else if s.starts_with("sqlserver://") {
-                    Ok(ConnectionInfo { db_type: DbType::Sqlserver, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()) })
+                    Ok(ConnectionInfo { db_type: DbType::Mongodb, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None })
+                } else if s.starts_with("sqlserver://") || s.to_lowercase().contains("initial catalog=") {
+                    let use_entra_id = s.to_lowercase().contains("authentication=activedirectoryintegrated") 
+                                    || s.to_lowercase().contains("authentication=activedirectorymsi")
+                                    || s.to_lowercase().contains("authentication=activedirectorydefault");
+                    
+                    Ok(ConnectionInfo { 
+                        db_type: DbType::Sqlserver, 
+                        host: "".to_string(), 
+                        port: 0, 
+                        user: None, 
+                        password: None, 
+                        database: Some(s.clone()),
+                        use_entra_id: Some(use_entra_id)
+                    })
                 } else {
                     Err("Unsupported connection string format".to_string())
                 }
             }
         }
     }
+}
+
+async fn get_sqlserver_token() -> Result<String, String> {
+    let credential = DefaultAzureCredential::create(Default::default())
+        .map_err(|e| format!("Failed to initialize Azure credentials: {}", e))?;
+    
+    let token_response = credential
+        .get_token(&["https://database.windows.net/.default"])
+        .await
+        .map_err(|e| format!("Failed to fetch Entra ID token: {}", e))?;
+    
+    Ok(token_response.token.secret().to_string())
 }
 
 pub async fn test_connection(wrapper: ConnectionWrapper) -> Result<String, String> {
@@ -135,33 +160,66 @@ pub async fn test_connection(wrapper: ConnectionWrapper) -> Result<String, Strin
             }
         }
         DbType::Sqlserver => {
-            if let Some(url) = info.database {
-                // Tiberius doesn't support connection strings directly easily in this way,
-                // but for demo we'll assume standard config.
-                let config = Config::from_ado_string(&url).map_err(|e| e.to_string())?;
-                let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| e.to_string())?;
-                tcp.set_nodelay(true).map_err(|e| e.to_string())?;
-                match TiberiusClient::connect(config, tcp.compat_write()).await {
-                    Ok(_) => Ok("Connection successful".to_string()),
-                    Err(e) => Err(format!("SQL Server connection failed: {}", e)),
-                }
+            let mut config = if let Some(url) = info.database {
+                Config::from_ado_string(&url).map_err(|e| e.to_string())?
             } else {
-                let mut config = Config::new();
-                config.host(&info.host);
-                config.port(info.port);
+                let mut c = Config::new();
+                c.host(&info.host);
+                c.port(info.port);
                 if let Some(user) = info.user {
-                    config.authentication(tiberius::AuthMethod::sql_server(user, info.password.unwrap_or_default()));
+                    c.authentication(AuthMethod::sql_server(user, info.password.unwrap_or_default()));
                 }
+                if let Some(db) = info.database {
+                    c.database(&db);
+                }
+                c.trust_cert();
+                c
+            };
+
+            if info.use_entra_id.unwrap_or(false) {
+                let token = get_sqlserver_token().await?;
+                config.authentication(AuthMethod::AADToken(token));
+                config.encryption(tiberius::EncryptionLevel::Required);
                 config.trust_cert();
-                let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| e.to_string())?;
-                tcp.set_nodelay(true).map_err(|e| e.to_string())?;
-                match TiberiusClient::connect(config, tcp.compat_write()).await {
-                    Ok(_) => Ok("Connection successful".to_string()),
-                    Err(e) => Err(format!("SQL Server connection failed: {}", e)),
-                }
+            }
+
+            let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| e.to_string())?;
+            tcp.set_nodelay(true).map_err(|e| e.to_string())?;
+            match TiberiusClient::connect(config, tcp.compat_write()).await {
+                Ok(_) => Ok("Connection successful".to_string()),
+                Err(e) => Err(format!("SQL Server connection failed: {}", e)),
             }
         }
     }
+}
+
+async fn get_sqlserver_client(info: &ConnectionInfo) -> Result<TiberiusClient<tokio_util::compat::Compat<TcpStream>>, String> {
+    let mut config = if let Some(url) = &info.database {
+        Config::from_ado_string(url).map_err(|e| e.to_string())?
+    } else {
+        let mut c = Config::new();
+        c.host(&info.host);
+        c.port(info.port);
+        if let Some(user) = &info.user {
+            c.authentication(AuthMethod::sql_server(user, info.password.clone().unwrap_or_default()));
+        }
+        if let Some(db) = &info.database {
+            c.database(db);
+        }
+        c.trust_cert();
+        c
+    };
+
+    if info.use_entra_id.unwrap_or(false) {
+        let token = get_sqlserver_token().await?;
+        config.authentication(AuthMethod::AADToken(token));
+        config.encryption(tiberius::EncryptionLevel::Required);
+        config.trust_cert();
+    }
+
+    let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| e.to_string())?;
+    tcp.set_nodelay(true).map_err(|e| e.to_string())?;
+    TiberiusClient::connect(config, tcp.compat_write()).await.map_err(|e| e.to_string())
 }
 
 pub async fn execute_query(wrapper: ConnectionWrapper, query: String) -> Result<QueryResult, String> {
@@ -319,23 +377,7 @@ pub async fn execute_query(wrapper: ConnectionWrapper, query: String) -> Result<
             })
         }
         DbType::Sqlserver => {
-            let mut client = if let Some(url) = info.database {
-                let config = Config::from_ado_string(&url).map_err(|e| e.to_string())?;
-                let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| e.to_string())?;
-                tcp.set_nodelay(true).map_err(|e| e.to_string())?;
-                TiberiusClient::connect(config, tcp.compat_write()).await.map_err(|e| e.to_string())?
-            } else {
-                let mut config = Config::new();
-                config.host(&info.host);
-                config.port(info.port);
-                if let Some(user) = info.user {
-                    config.authentication(tiberius::AuthMethod::sql_server(user, info.password.unwrap_or_default()));
-                }
-                config.trust_cert();
-                let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| e.to_string())?;
-                tcp.set_nodelay(true).map_err(|e| e.to_string())?;
-                TiberiusClient::connect(config, tcp.compat_write()).await.map_err(|e| e.to_string())?
-            };
+            let mut client = get_sqlserver_client(&info).await?;
 
             let mut stream = client.query(query, &[]).await.map_err(|e| e.to_string())?;
             
@@ -434,15 +476,23 @@ pub async fn get_tables(wrapper: ConnectionWrapper) -> Result<Vec<TableInfo>, St
             Ok(collections.into_iter().map(|name| TableInfo { name, schema: None }).collect())
         }
         DbType::Sqlserver => {
+            let mut client = get_sqlserver_client(&info).await?;
             let query = "SELECT TABLE_NAME as name, TABLE_SCHEMA as schema FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'";
-            let res = execute_query(wrapper, query.to_string()).await?;
-            Ok(res.rows.into_iter().filter_map(|v| {
-                let obj = v.as_object()?;
-                Some(TableInfo {
-                    name: obj.get("name")?.as_str()?.to_string(),
-                    schema: obj.get("schema")?.as_str().map(|s| s.to_string()),
-                })
-            }).collect())
+            let mut stream = client.query(query, &[]).await.map_err(|e| e.to_string())?;
+            
+            let mut results = Vec::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(tiberius::QueryItem::Row(row)) => {
+                        results.push(TableInfo {
+                            name: row.try_get::<&str, _>(0).unwrap_or(Some("")).unwrap_or("").to_string(),
+                            schema: row.try_get::<&str, _>(1).unwrap_or(None).map(|s| s.to_string()),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(results)
         }
     }
 }
@@ -519,19 +569,27 @@ pub async fn get_columns(wrapper: ConnectionWrapper, table: String, schema: Opti
             }
         }
         DbType::Sqlserver => {
+            let mut client = get_sqlserver_client(&info).await?;
             let query = format!(
                 "SELECT COLUMN_NAME as name, DATA_TYPE as data_type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}' AND TABLE_SCHEMA = '{}'",
                 table,
                 schema.unwrap_or_else(|| "dbo".to_string())
             );
-            let res = execute_query(wrapper, query).await?;
-            Ok(res.rows.into_iter().filter_map(|v| {
-                let obj = v.as_object()?;
-                Some(ColumnInfo {
-                    name: obj.get("name")?.as_str()?.to_string(),
-                    data_type: obj.get("data_type")?.as_str()?.to_string(),
-                })
-            }).collect())
+            let mut stream = client.query(query, &[]).await.map_err(|e| e.to_string())?;
+            
+            let mut results = Vec::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(tiberius::QueryItem::Row(row)) => {
+                        results.push(ColumnInfo {
+                            name: row.try_get::<&str, _>(0).unwrap_or(Some("")).unwrap_or("").to_string(),
+                            data_type: row.try_get::<&str, _>(1).unwrap_or(Some("")).unwrap_or("").to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(results)
         }
     }
 }

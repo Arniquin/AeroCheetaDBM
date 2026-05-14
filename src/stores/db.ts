@@ -8,6 +8,7 @@ export interface ConnectionInfo {
   user?: string;
   password?: string;
   database?: string;
+  use_entra_id?: boolean;
 }
 
 export interface TableInfo {
