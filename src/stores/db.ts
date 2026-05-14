@@ -9,6 +9,7 @@ export interface ConnectionInfo {
   password?: string;
   database?: string;
   use_entra_id?: boolean;
+  trust_server_certificate?: boolean;
 }
 
 export interface TableInfo {

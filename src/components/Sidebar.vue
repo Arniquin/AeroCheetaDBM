@@ -1,14 +1,88 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { ref, watch, computed } from 'vue';
 import { useDbStore, type ConnectionInfo } from '../stores/db';
-import { Database, Table, Columns, Plus, Trash2, Server, Star, RefreshCcw, ArrowLeft, LogOut, Settings, Folder, Pencil } from 'lucide-vue-next';
+import { Database, Table, Columns, Plus, Trash2, Server, Star, RefreshCcw, ArrowLeft, LogOut, Settings, Folder, Pencil, Info, Copy, Check } from 'lucide-vue-next';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 
 const dbStore = useDbStore();
 
-type ViewMode = 'form' | 'list' | 'explorer' | 'settings' | 'exit';
+type ViewMode = 'form' | 'list' | 'explorer' | 'settings' | 'exit' | 'details';
 const viewMode = ref<ViewMode>('list');
 const editingId = ref<string | null>(null);
+const copied = ref(false);
+
+const generatedConnectionString = computed(() => {
+  if (dbStore.connectionString) return dbStore.connectionString;
+  const info = dbStore.currentConnection;
+  if (!info) return '';
+
+  const userPass = info.user ? `${info.user}:${info.password || '••••••••'}@` : '';
+  const port = info.port ? `:${info.port}` : '';
+  const db = info.database ? `/${info.database}` : '';
+  
+  let params = [];
+  if (info.trust_server_certificate) {
+    if (info.db_type === 'postgres') params.push('sslmode=no-verify');
+    if (info.db_type === 'mysql') params.push('ssl-mode=Disabled');
+    if (info.db_type === 'mongodb') params.push('tlsInsecure=true');
+  }
+
+  const paramStr = params.length > 0 ? `?${params.join('&')}` : '';
+
+  switch (info.db_type) {
+    case 'postgres': return `postgres://${userPass}${info.host}${port}${db}${paramStr}`;
+    case 'mysql': return `mysql://${userPass}${info.host}${port}${db}${paramStr}`;
+    case 'mongodb': return `mongodb://${userPass}${info.host}${port}${db}${paramStr}`;
+    case 'sqlserver': 
+      if (info.use_entra_id) {
+        return `Server=${info.host}${port};Initial Catalog=${info.database || ''};Authentication=ActiveDirectoryIntegrated;TrustServerCertificate=${info.trust_server_certificate ? 'true' : 'false'}`;
+      }
+      return `Server=${info.host}${port};Initial Catalog=${info.database || ''};User ID=${info.user || ''};Password=••••••••;TrustServerCertificate=${info.trust_server_certificate ? 'true' : 'false'}`;
+    default: return 'Mock Connection';
+  }
+});
+
+function copyToClipboard(text: string) {
+  // Use connectionString if present for copying real password, 
+  // or regenerate it without masking for copying if possible, 
+  // but for UI display we masked it.
+  // Actually let's just copy exactly what we see for now or provide a real copy.
+  // Real copy logic:
+  let realString = '';
+  if (dbStore.connectionString) {
+    realString = dbStore.connectionString;
+  } else if (dbStore.currentConnection) {
+    const info = dbStore.currentConnection;
+    const userPass = info.user ? `${info.user}:${info.password || ''}@` : '';
+    const port = info.port ? `:${info.port}` : '';
+    const db = info.database ? `/${info.database}` : '';
+    let params = [];
+    if (info.trust_server_certificate) {
+      if (info.db_type === 'postgres') params.push('sslmode=no-verify');
+      if (info.db_type === 'mysql') params.push('ssl-mode=Disabled');
+      if (info.db_type === 'mongodb') params.push('tlsInsecure=true');
+    }
+    const paramStr = params.length > 0 ? `?${params.join('&')}` : '';
+    
+    switch (info.db_type) {
+      case 'postgres': realString = `postgres://${userPass}${info.host}${port}${db}${paramStr}`; break;
+      case 'mysql': realString = `mysql://${userPass}${info.host}${port}${db}${paramStr}`; break;
+      case 'mongodb': realString = `mongodb://${userPass}${info.host}${port}${db}${paramStr}`; break;
+      case 'sqlserver': 
+        if (info.use_entra_id) {
+          realString = `Server=${info.host}${port};Initial Catalog=${info.database || ''};Authentication=ActiveDirectoryIntegrated;TrustServerCertificate=${info.trust_server_certificate ? 'true' : 'false'}`;
+        } else {
+          realString = `Server=${info.host}${port};Initial Catalog=${info.database || ''};User ID=${info.user || ''};Password=${info.password || ''};TrustServerCertificate=${info.trust_server_certificate ? 'true' : 'false'}`;
+        }
+        break;
+      default: realString = 'Mock Connection';
+    }
+  }
+
+  navigator.clipboard.writeText(realString || text);
+  copied.value = true;
+  setTimeout(() => copied.value = false, 2000);
+}
 
 const newConn = ref<ConnectionInfo>({
   db_type: 'postgres',
@@ -48,7 +122,8 @@ function openNewConnectionForm() {
     user: '',
     password: '',
     database: '',
-    use_entra_id: false
+    use_entra_id: false,
+    trust_server_certificate: false
   };
   useConnectionString.value = false;
   connString.value = '';
@@ -268,6 +343,13 @@ function getStatusColor(status: string) {
             <label>Database Name</label>
             <input v-model="newConn.database" placeholder="e.g. production_db" />
           </div>
+
+          <div class="field">
+            <div class="checkbox-field">
+              <input type="checkbox" v-model="newConn.trust_server_certificate" id="trust-cert" />
+              <label for="trust-cert">Trust Server Certificate</label>
+            </div>
+          </div>
         </div>
         
         <div v-else class="string-container">
@@ -323,6 +405,7 @@ function getStatusColor(status: string) {
           <Database :size="14" /> {{ dbStore.currentConnection?.database || 'Connected' }}
         </div>
         <div class="explorer-actions">
+          <button @click="viewMode = 'details'" class="icon-btn" title="Connection Details"><Info :size="14" /></button>
           <button @click="dbStore.fetchTables()" class="icon-btn" title="Refresh Tables"><RefreshCcw :size="14" /></button>
         </div>
       </div>
@@ -338,6 +421,57 @@ function getStatusColor(status: string) {
             </div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- CONNECTION DETAILS VIEW -->
+    <div v-else-if="viewMode === 'details'" class="details-view">
+      <div class="section-header">
+        <div class="section-title">Connection Details</div>
+      </div>
+      <div class="details-content">
+        <div class="detail-item" v-if="dbStore.currentConnection">
+          <label>Type</label>
+          <div class="value">{{ dbStore.currentConnection.db_type }}</div>
+        </div>
+        <div class="detail-item" v-if="dbStore.currentConnection">
+          <label>Host</label>
+          <div class="value">{{ dbStore.currentConnection.host }}</div>
+        </div>
+        <div class="detail-item" v-if="dbStore.currentConnection">
+          <label>Port</label>
+          <div class="value">{{ dbStore.currentConnection.port }}</div>
+        </div>
+        <div class="detail-item" v-if="dbStore.currentConnection?.user">
+          <label>User</label>
+          <div class="value">{{ dbStore.currentConnection.user }}</div>
+        </div>
+        <div class="detail-item" v-if="dbStore.currentConnection?.database">
+          <label>Database</label>
+          <div class="value">{{ dbStore.currentConnection.database }}</div>
+        </div>
+        <div class="detail-item" v-if="dbStore.currentConnection?.use_entra_id">
+          <label>Auth</label>
+          <div class="value">Microsoft Entra ID</div>
+        </div>
+        <div class="detail-item" v-if="dbStore.currentConnection?.trust_server_certificate">
+          <label>Security</label>
+          <div class="value">Trust Server Certificate Enabled</div>
+        </div>
+
+        <div class="detail-item full-width">
+          <label>Generated Connection String</label>
+          <div class="string-box">
+            <code>{{ generatedConnectionString }}</code>
+            <button @click="copyToClipboard(generatedConnectionString)" class="copy-btn" :title="copied ? 'Copied!' : 'Copy to clipboard'">
+              <Check v-if="copied" :size="14" />
+              <Copy v-else :size="14" />
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button @click="viewMode = 'explorer'" class="secondary-btn">Back to Explorer</button>
       </div>
     </div>
   </div>
@@ -658,6 +792,72 @@ input:focus, select:focus, textarea:focus {
 }
 .settings-view {
   padding: 16px;
+}
+.exit-view, .details-view {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.details-content {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 20px;
+}
+.detail-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.detail-item label {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: #888;
+  font-weight: bold;
+}
+.detail-item .value {
+  font-size: 13px;
+  color: #fff;
+  background: #1e1e1e;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid #333;
+}
+.detail-item.full-width {
+  margin-top: 8px;
+}
+.string-box {
+  background: #1e1e1e;
+  border: 1px solid #333;
+  padding: 10px;
+  border-radius: 4px;
+  position: relative;
+  word-break: break-all;
+  font-family: monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #ce9178;
+}
+.copy-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: #333;
+  border: 1px solid #444;
+  color: #ccc;
+  padding: 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.copy-btn:hover {
+  background: #444;
+  color: #fff;
 }
 .exit-view {
   padding: 16px;

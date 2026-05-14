@@ -13,12 +13,12 @@ A high-performance, lightweight desktop database management client built with **
 Connect to various database systems using a single unified interface:
 - **PostgreSQL:** Full support via `sqlx`.
 - **MySQL:** High-performance connection via `sqlx`.
-- **SQL Server:** Native support for TDS protocol via `tiberius`.
+- **SQL Server:** Native support for TDS protocol, featuring **Microsoft Entra ID (Integrated)** and standard SQL Auth.
 - **MongoDB:** NoSQL exploration and command execution via the official Rust driver.
 - **Mock DB:** Built-in provider for testing and demos without external dependencies.
 
 ### 📝 Advanced SQL Editor
-A professional-grade editing experience powered by **Monaco Editor** (the engine behind VS Code):
+A professional-grade editing experience powered by **Monaco Editor**:
 - **Multi-Tab Support:** Manage multiple queries simultaneously.
 - **Intelligent Autocomplete:** Table and column name suggestions based on your active schema.
 - **SQL Formatting:** Keep your queries clean with built-in formatting (`Shift+Alt+F`).
@@ -26,19 +26,19 @@ A professional-grade editing experience powered by **Monaco Editor** (the engine
 - **File System Integration:** Open and save SQL files directly to your local disk.
 
 ### 🛠️ Connection Management
-- **Persistence:** Save and organize your most-used connections securely.
-- **Quick Edit:** Easily update connection details (Host, Port, User, etc.) or change aliases.
+- **Persistence & Editing:** Save connections securely and update them easily with the built-in editor.
+- **Entra ID & Security:** Support for Azure Integrated identities and "Trust Server Certificate" for self-signed SSL.
+- **Connection Details:** View all active parameters and copy the **Generated Connection String** with one click.
 - **Flexible Fields:** Support for both structured forms and raw connection strings.
-- **Default Ports:** Automatically detects and sets standard ports for different DB types.
 
 ### ⚙️ User Settings & Performance
-- **Idle Timeout:** Automatically disconnect from databases after a period of inactivity (configurable from 5 min to 48 hours).
-- **Workspace Organization:** Set a default workspace folder to automatically organize saved queries by database alias.
+- **Idle Timeout:** Automatically disconnect after inactivity (Default: 1h, configurable from 5min to 48h).
+- **Workspace Organization:** Automatically organize saved queries into subfolders based on database aliases.
 - **Dark Mode:** A sleek, VS Code-inspired interface designed for long coding sessions.
 
 ## 🛠️ Tech Stack
 
-- **Backend:** Rust, Tauri v2, Tokio, SQLx, Tiberius, MongoDB Rust Driver.
+- **Backend:** Rust, Tauri v2, Tokio, SQLx, Tiberius, Azure Identity, MongoDB Rust Driver.
 - **Frontend:** Vue 3 (Composition API), TypeScript, Pinia (State Management), Vite.
 - **Components:** Monaco Editor, Lucide Vue Next Icons, SQL Formatter.
 
@@ -63,12 +63,13 @@ npm run tauri dev
 ```
 
 ### Build (Portable .exe)
-To create a single-file portable executable for Windows:
-1. Ensure `tauri.conf.json` has `installerMode: "portable"` in the NSIS settings.
-2. Run:
+To create a standalone portable executable for Windows:
+1. Run the build command on a Windows machine:
    ```bash
    npm run tauri build
    ```
+2. Find your standalone portable app in:
+   📂 `src-tauri/target/release/AeroCheetahDBM.exe`
 
 ## 📂 Project Structure
 
