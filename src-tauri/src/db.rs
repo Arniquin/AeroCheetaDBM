@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, Column};
+use sqlx::{Row, Column, Connection};
+use sqlx::postgres::PgConnection;
+use sqlx::mysql::MySqlConnection;
 use mongodb::{Client, bson::{Document, doc}};
 use tiberius::{Client as TiberiusClient, Config, AuthMethod};
 use tokio::net::TcpStream;
@@ -33,6 +35,7 @@ pub struct ConnectionInfo {
     pub database: Option<String>,
     pub use_entra_id: Option<bool>,
     pub trust_server_certificate: Option<bool>,
+    pub connect_timeout: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,11 +75,11 @@ impl ConnectionWrapper {
                                             || s_lower.contains("sslmode=disable");
 
                 if s.starts_with("postgres://") {
-                    Ok(ConnectionInfo { db_type: DbType::Postgres, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None, trust_server_certificate: Some(trust_server_certificate) })
+                    Ok(ConnectionInfo { db_type: DbType::Postgres, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None, trust_server_certificate: Some(trust_server_certificate), connect_timeout: None })
                 } else if s.starts_with("mysql://") {
-                    Ok(ConnectionInfo { db_type: DbType::Mysql, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None, trust_server_certificate: Some(trust_server_certificate) })
+                    Ok(ConnectionInfo { db_type: DbType::Mysql, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None, trust_server_certificate: Some(trust_server_certificate), connect_timeout: None })
                 } else if s.starts_with("mongodb://") {
-                    Ok(ConnectionInfo { db_type: DbType::Mongodb, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None, trust_server_certificate: Some(trust_server_certificate) })
+                    Ok(ConnectionInfo { db_type: DbType::Mongodb, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None, trust_server_certificate: Some(trust_server_certificate), connect_timeout: None })
                 } else if s.starts_with("sqlserver://") || s_lower.contains("initial catalog=") {
                     let use_entra_id = s_lower.contains("authentication=activedirectoryintegrated") 
                                     || s_lower.contains("authentication=activedirectorymsi")
@@ -90,7 +93,8 @@ impl ConnectionWrapper {
                         password: None, 
                         database: Some(s.clone()),
                         use_entra_id: Some(use_entra_id),
-                        trust_server_certificate: Some(trust_server_certificate)
+                        trust_server_certificate: Some(trust_server_certificate),
+                        connect_timeout: None
                     })
                 } else {
                     Err("Unsupported connection string format".to_string())
@@ -112,62 +116,108 @@ async fn get_sqlserver_token() -> Result<String, String> {
     Ok(token_response.token.secret().to_string())
 }
 
+fn build_connection_url(info: &ConnectionInfo) -> String {
+    if !info.host.is_empty() {
+        // Structured config from form
+        let user_part = match (&info.user, &info.password) {
+            (Some(u), Some(p)) if !u.is_empty() => format!("{}:{}@", u, p),
+            (Some(u), None) if !u.is_empty() => format!("{}@", u),
+            _ => "".to_string(),
+        };
+        
+        let db_path = match info.database.as_deref() {
+            Some(d) if !d.trim().is_empty() => format!("/{}", d),
+            _ => "".to_string(),
+        };
+
+        let timeout = info.connect_timeout.unwrap_or(30);
+
+        match info.db_type {
+            DbType::Postgres => {
+                let mut url = format!(
+                    "postgres://{}{}:{}{}",
+                    user_part,
+                    info.host,
+                    info.port,
+                    db_path
+                );
+                if info.trust_server_certificate.unwrap_or(false) && !url.contains("sslmode=") {
+                    url.push_str(if url.contains('?') { "&" } else { "?" });
+                    url.push_str("sslmode=no-verify");
+                }
+                if !url.contains("connect_timeout=") {
+                    url.push_str(if url.contains('?') { "&" } else { "?" });
+                    url.push_str(&format!("connect_timeout={}", timeout));
+                }
+                url
+            }
+            DbType::Mysql => {
+                let mut url = format!(
+                    "mysql://{}{}:{}{}",
+                    user_part,
+                    info.host,
+                    info.port,
+                    db_path
+                );
+                if info.trust_server_certificate.unwrap_or(false) && !url.contains("ssl-mode=") {
+                    url.push_str(if url.contains('?') { "&" } else { "?" });
+                    url.push_str("ssl-mode=Disabled");
+                }
+                if !url.contains("connect_timeout=") {
+                    url.push_str(if url.contains('?') { "&" } else { "?" });
+                    url.push_str(&format!("connect_timeout={}", timeout));
+                }
+                url
+            }
+            DbType::Mongodb => {
+                let mut url = format!(
+                    "mongodb://{}{}:{}{}",
+                    user_part,
+                    info.host,
+                    info.port,
+                    db_path
+                );
+                if info.trust_server_certificate.unwrap_or(false) && !url.contains("tlsInsecure=") {
+                    url.push_str(if url.contains('?') { "&" } else { "?" });
+                    url.push_str("tlsInsecure=true");
+                }
+                if !url.contains("connectTimeoutMS=") {
+                    url.push_str(if url.contains('?') { "&" } else { "?" });
+                    url.push_str(&format!("connectTimeoutMS={}", timeout * 1000));
+                }
+                url
+            }
+            _ => "".to_string(),
+        }
+    } else {
+        // Connection string mode
+        info.database.clone().unwrap_or_default()
+    }
+}
+
 pub async fn test_connection(wrapper: ConnectionWrapper) -> Result<String, String> {
     let info = wrapper.get_info()?;
     match info.db_type {
         DbType::Mock => Ok("Connection successful (Mock)".to_string()),
         DbType::Postgres => {
-            let mut url = info.database.unwrap_or_else(|| {
-                format!(
-                    "postgres://{}:{}@{}:{}/postgres",
-                    info.user.unwrap_or_default(),
-                    info.password.unwrap_or_default(),
-                    info.host,
-                    info.port
-                )
-            });
-            if info.trust_server_certificate.unwrap_or(false) && !url.contains("sslmode=") {
-                url.push_str(if url.contains('?') { "&" } else { "?" });
-                url.push_str("sslmode=no-verify");
-            }
-            match sqlx::PgPool::connect(&url).await {
+            let url = build_connection_url(&info);
+            println!("Connecting to Postgres with URL: {}", url);
+            match PgConnection::connect(&url).await {
                 Ok(_) => Ok("Connection successful".to_string()),
                 Err(e) => Err(format!("Postgres connection failed: {}", e)),
             }
         }
         DbType::Mysql => {
-            let mut url = info.database.unwrap_or_else(|| {
-                format!(
-                    "mysql://{}:{}@{}:{}/mysql",
-                    info.user.unwrap_or_default(),
-                    info.password.unwrap_or_default(),
-                    info.host,
-                    info.port
-                )
-            });
-            if info.trust_server_certificate.unwrap_or(false) && !url.contains("ssl-mode=") {
-                url.push_str(if url.contains('?') { "&" } else { "?" });
-                url.push_str("ssl-mode=Disabled");
-            }
-            match sqlx::MySqlPool::connect(&url).await {
+            let url = build_connection_url(&info);
+            println!("Connecting to MySQL with URL: {}", url);
+            match MySqlConnection::connect(&url).await {
                 Ok(_) => Ok("Connection successful".to_string()),
                 Err(e) => Err(format!("MySQL connection failed: {}", e)),
             }
         }
         DbType::Mongodb => {
-            let mut url = info.database.unwrap_or_else(|| {
-                format!(
-                    "mongodb://{}:{}@{}:{}/admin",
-                    info.user.unwrap_or_default(),
-                    info.password.unwrap_or_default(),
-                    info.host,
-                    info.port
-                )
-            });
-            if info.trust_server_certificate.unwrap_or(false) && !url.contains("tlsInsecure=") {
-                url.push_str(if url.contains('?') { "&" } else { "?" });
-                url.push_str("tlsInsecure=true");
-            }
+            let url = build_connection_url(&info);
+            println!("Connecting to MongoDB with URL: {}", url);
             match Client::with_uri_str(&url).await {
                 Ok(client) => {
                     match client.list_database_names().await {
@@ -179,19 +229,27 @@ pub async fn test_connection(wrapper: ConnectionWrapper) -> Result<String, Strin
             }
         }
         DbType::Sqlserver => {
-            let mut config = if let Some(url) = info.database {
-                Config::from_ado_string(&url).map_err(|e| e.to_string())?
-            } else {
+            let mut config = if !info.host.is_empty() {
+                // Structured config from form
                 let mut c = Config::new();
                 c.host(&info.host);
                 c.port(info.port);
-                if let Some(user) = info.user {
-                    c.authentication(AuthMethod::sql_server(user, info.password.unwrap_or_default()));
+                if let Some(user) = &info.user {
+                    if !user.trim().is_empty() {
+                        c.authentication(AuthMethod::sql_server(user, info.password.as_deref().unwrap_or_default()));
+                    }
                 }
-                if let Some(db) = info.database {
-                    c.database(&db);
+                if let Some(db) = &info.database {
+                    if !db.trim().is_empty() {
+                        c.database(db);
+                    }
                 }
                 c
+            } else if let Some(url) = info.database {
+                // Connection string
+                Config::from_ado_string(&url).map_err(|e| e.to_string())?
+            } else {
+                return Err("Invalid SQL Server configuration: No host or connection string provided".to_string());
             };
 
             if info.use_entra_id.unwrap_or(false) {
@@ -204,30 +262,45 @@ pub async fn test_connection(wrapper: ConnectionWrapper) -> Result<String, Strin
                 config.trust_cert();
             }
 
-            let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| e.to_string())?;
-            tcp.set_nodelay(true).map_err(|e| e.to_string())?;
-            match TiberiusClient::connect(config, tcp.compat_write()).await {
-                Ok(_) => Ok("Connection successful".to_string()),
-                Err(e) => Err(format!("SQL Server connection failed: {}", e)),
+            let timeout_duration = std::time::Duration::from_secs(info.connect_timeout.unwrap_or(30) as u64);
+            
+            let connect_future = async {
+                let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| e.to_string())?;
+                tcp.set_nodelay(true).map_err(|e| e.to_string())?;
+                TiberiusClient::connect(config, tcp.compat_write()).await.map_err(|e| e.to_string())
+            };
+
+            match tokio::time::timeout(timeout_duration, connect_future).await {
+                Ok(Ok(_)) => Ok("Connection successful".to_string()),
+                Ok(Err(e)) => Err(format!("SQL Server connection failed: {}", e)),
+                Err(_) => Err("SQL Server connection timed out".to_string()),
             }
         }
     }
 }
 
 async fn get_sqlserver_client(info: &ConnectionInfo) -> Result<TiberiusClient<tokio_util::compat::Compat<TcpStream>>, String> {
-    let mut config = if let Some(url) = &info.database {
-        Config::from_ado_string(url).map_err(|e| e.to_string())?
-    } else {
+    let mut config = if !info.host.is_empty() {
+        // Structured config from form
         let mut c = Config::new();
         c.host(&info.host);
         c.port(info.port);
         if let Some(user) = &info.user {
-            c.authentication(AuthMethod::sql_server(user, info.password.clone().unwrap_or_default()));
+            if !user.trim().is_empty() {
+                c.authentication(AuthMethod::sql_server(user, info.password.as_deref().unwrap_or_default()));
+            }
         }
         if let Some(db) = &info.database {
-            c.database(db);
+            if !db.trim().is_empty() {
+                c.database(db);
+            }
         }
         c
+    } else if let Some(url) = &info.database {
+        // Connection string
+        Config::from_ado_string(url).map_err(|e| e.to_string())?
+    } else {
+        return Err("Invalid SQL Server configuration: No host or connection string provided".to_string());
     };
 
     if info.use_entra_id.unwrap_or(false) {
@@ -240,9 +313,18 @@ async fn get_sqlserver_client(info: &ConnectionInfo) -> Result<TiberiusClient<to
         config.trust_cert();
     }
 
-    let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| e.to_string())?;
-    tcp.set_nodelay(true).map_err(|e| e.to_string())?;
-    TiberiusClient::connect(config, tcp.compat_write()).await.map_err(|e| e.to_string())
+    let timeout_duration = std::time::Duration::from_secs(info.connect_timeout.unwrap_or(30) as u64);
+
+    let connect_future = async {
+        let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| e.to_string())?;
+        tcp.set_nodelay(true).map_err(|e| e.to_string())?;
+        TiberiusClient::connect(config, tcp.compat_write()).await.map_err(|e| e.to_string())
+    };
+
+    match tokio::time::timeout(timeout_duration, connect_future).await {
+        Ok(res) => res,
+        Err(_) => Err("SQL Server connection timed out".to_string()),
+    }
 }
 
 pub async fn execute_query(wrapper: ConnectionWrapper, query: String) -> Result<QueryResult, String> {
@@ -286,19 +368,7 @@ pub async fn execute_query(wrapper: ConnectionWrapper, query: String) -> Result<
             })
         }
         DbType::Postgres => {
-            let mut url = info.database.unwrap_or_else(|| {
-                format!(
-                    "postgres://{}:{}@{}:{}/postgres",
-                    info.user.unwrap_or_default(),
-                    info.password.unwrap_or_default(),
-                    info.host,
-                    info.port
-                )
-            });
-            if info.trust_server_certificate.unwrap_or(false) && !url.contains("sslmode=") {
-                url.push_str(if url.contains('?') { "&" } else { "?" });
-                url.push_str("sslmode=no-verify");
-            }
+            let url = build_connection_url(&info);
             let pool = sqlx::PgPool::connect(&url).await.map_err(|e| e.to_string())?;
             let rows = sqlx::query(&query).fetch_all(&pool).await.map_err(|e| e.to_string())?;
             
@@ -326,19 +396,7 @@ pub async fn execute_query(wrapper: ConnectionWrapper, query: String) -> Result<
             })
         }
         DbType::Mysql => {
-            let mut url = info.database.unwrap_or_else(|| {
-                format!(
-                    "mysql://{}:{}@{}:{}/mysql",
-                    info.user.unwrap_or_default(),
-                    info.password.unwrap_or_default(),
-                    info.host,
-                    info.port
-                )
-            });
-            if info.trust_server_certificate.unwrap_or(false) && !url.contains("ssl-mode=") {
-                url.push_str(if url.contains('?') { "&" } else { "?" });
-                url.push_str("ssl-mode=Disabled");
-            }
+            let url = build_connection_url(&info);
             let pool = sqlx::MySqlPool::connect(&url).await.map_err(|e| e.to_string())?;
             let rows = sqlx::query(&query).fetch_all(&pool).await.map_err(|e| e.to_string())?;
             
@@ -366,19 +424,7 @@ pub async fn execute_query(wrapper: ConnectionWrapper, query: String) -> Result<
             })
         }
         DbType::Mongodb => {
-            let mut url = info.database.unwrap_or_else(|| {
-                format!(
-                    "mongodb://{}:{}@{}:{}/admin",
-                    info.user.unwrap_or_default(),
-                    info.password.unwrap_or_default(),
-                    info.host,
-                    info.port
-                )
-            });
-            if info.trust_server_certificate.unwrap_or(false) && !url.contains("tlsInsecure=") {
-                url.push_str(if url.contains('?') { "&" } else { "?" });
-                url.push_str("tlsInsecure=true");
-            }
+            let url = build_connection_url(&info);
             let client = Client::with_uri_str(&url).await.map_err(|e| e.to_string())?;
             let db_name = match &url.split('/').last() {
                 Some(name) if !name.is_empty() => name.split('?').next().unwrap_or("test"),
@@ -492,19 +538,7 @@ pub async fn get_tables(wrapper: ConnectionWrapper) -> Result<Vec<TableInfo>, St
         }
         DbType::Mongodb => {
             let info = wrapper.get_info()?;
-            let mut url = info.database.unwrap_or_else(|| {
-                format!(
-                    "mongodb://{}:{}@{}:{}/admin",
-                    info.user.unwrap_or_default(),
-                    info.password.unwrap_or_default(),
-                    info.host,
-                    info.port
-                )
-            });
-            if info.trust_server_certificate.unwrap_or(false) && !url.contains("tlsInsecure=") {
-                url.push_str(if url.contains('?') { "&" } else { "?" });
-                url.push_str("tlsInsecure=true");
-            }
+            let url = build_connection_url(&info);
             let client = Client::with_uri_str(&url).await.map_err(|e| e.to_string())?;
             let db_name = match &url.split('/').last() {
                 Some(name) if !name.is_empty() => name.split('?').next().unwrap_or("test"),
@@ -516,7 +550,7 @@ pub async fn get_tables(wrapper: ConnectionWrapper) -> Result<Vec<TableInfo>, St
         }
         DbType::Sqlserver => {
             let mut client = get_sqlserver_client(&info).await?;
-            let query = "SELECT TABLE_NAME as name, TABLE_SCHEMA as schema FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'";
+            let query = "SELECT TABLE_NAME as [name], TABLE_SCHEMA as [schema] FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'";
             let mut stream = client.query(query, &[]).await.map_err(|e| e.to_string())?;
             
             let mut results = Vec::new();
@@ -585,19 +619,7 @@ pub async fn get_columns(wrapper: ConnectionWrapper, table: String, schema: Opti
         }
         DbType::Mongodb => {
             let info = wrapper.get_info()?;
-            let mut url = info.database.unwrap_or_else(|| {
-                format!(
-                    "mongodb://{}:{}@{}:{}/admin",
-                    info.user.unwrap_or_default(),
-                    info.password.unwrap_or_default(),
-                    info.host,
-                    info.port
-                )
-            });
-            if info.trust_server_certificate.unwrap_or(false) && !url.contains("tlsInsecure=") {
-                url.push_str(if url.contains('?') { "&" } else { "?" });
-                url.push_str("tlsInsecure=true");
-            }
+            let url = build_connection_url(&info);
             let client = Client::with_uri_str(&url).await.map_err(|e| e.to_string())?;
             let db_name = match &url.split('/').last() {
                 Some(name) if !name.is_empty() => name.split('?').next().unwrap_or("test"),
@@ -614,7 +636,7 @@ pub async fn get_columns(wrapper: ConnectionWrapper, table: String, schema: Opti
         DbType::Sqlserver => {
             let mut client = get_sqlserver_client(&info).await?;
             let query = format!(
-                "SELECT COLUMN_NAME as name, DATA_TYPE as data_type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}' AND TABLE_SCHEMA = '{}'",
+                "SELECT COLUMN_NAME as [name], DATA_TYPE as [data_type] FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}' AND TABLE_SCHEMA = '{}'",
                 table,
                 schema.unwrap_or_else(|| "dbo".to_string())
             );

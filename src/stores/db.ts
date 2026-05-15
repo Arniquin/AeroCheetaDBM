@@ -10,6 +10,7 @@ export interface ConnectionInfo {
   database?: string;
   use_entra_id?: boolean;
   trust_server_certificate?: boolean;
+  connect_timeout?: number;
 }
 
 export interface TableInfo {
@@ -69,6 +70,7 @@ export const useDbStore = defineStore('db', {
     connectionStatus: 'disconnected' as ConnectionStatus,
     defaultWorkspace: null as string | null,
     connectionTimeout: 3600000 as number, // Default to 1 hour
+    connectTimeout: 30 as number, // Default connection timeout in seconds
     lastActionTimestamp: 0 as number,
     timeoutCheckInterval: null as any | null,
     savedConnections: [] as SavedConnection[],
@@ -110,12 +112,16 @@ export const useDbStore = defineStore('db', {
       this.error = null;
       try {
         if (typeof info === 'string') {
+          // For connection strings, we can't easily inject the timeout unless we parse it,
+          // so we'll rely on the backend default for now or pass it as a separate param if we refactor.
           await invoke('execute_query', { info, query: 'SELECT 1' });
           this.connectionString = info;
           this.currentConnection = null;
         } else {
-          await invoke('test_connection', { info });
-          this.currentConnection = info;
+          // Inject global connect timeout
+          const connectionInfo = { ...info, connect_timeout: this.connectTimeout };
+          await invoke('test_connection', { info: connectionInfo });
+          this.currentConnection = connectionInfo;
           this.connectionString = '';
         }
         this.currentAlias = alias || (typeof info === 'object' ? info.database : null) || 'default';
@@ -236,7 +242,8 @@ export const useDbStore = defineStore('db', {
     persistSettings() {
       localStorage.setItem('dbm_settings', JSON.stringify({
         defaultWorkspace: this.defaultWorkspace,
-        connectionTimeout: this.connectionTimeout
+        connectionTimeout: this.connectionTimeout,
+        connectTimeout: this.connectTimeout
       }));
     },
     loadSettings() {
@@ -245,6 +252,7 @@ export const useDbStore = defineStore('db', {
         const parsed = JSON.parse(settings);
         this.defaultWorkspace = parsed.defaultWorkspace;
         this.connectionTimeout = parsed.connectionTimeout !== undefined ? parsed.connectionTimeout : 3600000;
+        this.connectTimeout = parsed.connectTimeout !== undefined ? parsed.connectTimeout : 30;
       }
     },
     async fetchTables() {

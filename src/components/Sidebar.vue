@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue';
 import { useDbStore, type ConnectionInfo } from '../stores/db';
-import { Database, Table, Columns, Plus, Trash2, Server, Star, RefreshCcw, ArrowLeft, LogOut, Settings, Folder, Pencil, Info, Copy, Check } from 'lucide-vue-next';
+import { Database, Table, Columns, Plus, Trash2, Server, Star, RefreshCcw, ArrowLeft, LogOut, Settings, Folder, Pencil, Info, Copy, Check, Eye, EyeOff } from 'lucide-vue-next';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 
 const dbStore = useDbStore();
@@ -10,6 +10,7 @@ type ViewMode = 'form' | 'list' | 'explorer' | 'settings' | 'exit' | 'details';
 const viewMode = ref<ViewMode>('list');
 const editingId = ref<string | null>(null);
 const copied = ref(false);
+const showPassword = ref(false);
 
 const generatedConnectionString = computed(() => {
   if (dbStore.connectionString) return dbStore.connectionString;
@@ -115,6 +116,7 @@ const shouldSave = ref(true);
 function openNewConnectionForm() {
   editingId.value = null;
   connectionAlias.value = '';
+  showPassword.value = false;
   newConn.value = {
     db_type: 'postgres',
     host: 'localhost',
@@ -133,6 +135,7 @@ function openNewConnectionForm() {
 function editConnection(saved: any) {
   editingId.value = saved.id;
   connectionAlias.value = saved.alias;
+  showPassword.value = false;
   
   if (typeof saved.info === 'string') {
     useConnectionString.value = true;
@@ -284,6 +287,11 @@ function getStatusColor(status: string) {
         </select>
         <p class="help-text">Auto-disconnect after period of inactivity.</p>
       </div>
+      <div class="setting-item mt-16">
+        <label>Connection Timeout (seconds)</label>
+        <input type="number" v-model.number="dbStore.connectTimeout" @change="dbStore.persistSettings" min="1" max="300" />
+        <p class="help-text">Timeout for initial connection (Default: 30).</p>
+      </div>
       <button @click="viewMode = 'list'" class="secondary-btn mt-16">Close Settings</button>
     </div>
 
@@ -337,7 +345,13 @@ function getStatusColor(status: string) {
           </div>
           <div class="field">
             <label>Password</label>
-            <input v-model="newConn.password" type="password" placeholder="••••••••" :disabled="newConn.use_entra_id" />
+            <div class="password-input-wrapper">
+              <input v-model="newConn.password" :type="showPassword ? 'text' : 'password'" placeholder="••••••••" :disabled="newConn.use_entra_id" />
+              <button type="button" @click="showPassword = !showPassword" class="password-toggle" :disabled="newConn.use_entra_id" :title="showPassword ? 'Hide password' : 'Show password'">
+                <Eye v-if="!showPassword" :size="14" />
+                <EyeOff v-else :size="14" />
+              </button>
+            </div>
           </div>
           <div class="field">
             <label>Database Name</label>
@@ -542,6 +556,36 @@ function getStatusColor(status: string) {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+.password-input-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.password-input-wrapper input {
+  width: 100%;
+  padding-right: 36px;
+}
+.password-toggle {
+  position: absolute;
+  right: 8px;
+  background: transparent;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border-radius: 4px;
+}
+.password-toggle:hover:not(:disabled) {
+  color: #fff;
+  background: #3c3c3c;
+}
+.password-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 .field label {
   display: flex;
