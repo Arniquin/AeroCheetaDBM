@@ -26,6 +26,16 @@ async fn get_columns(info: ConnectionWrapper, table: String, schema: Option<Stri
     db::get_columns(info, table, schema).await
 }
 
+#[tauri::command]
+async fn get_odbc_drivers() -> Result<Vec<String>, String> {
+    db::get_odbc_drivers()
+}
+
+#[tauri::command]
+async fn get_databases(info: ConnectionWrapper) -> Result<Vec<String>, String> {
+    db::get_databases(info).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -37,7 +47,9 @@ pub fn run() {
             test_connection_string,
             execute_query,
             get_tables,
-            get_columns
+            get_columns,
+            get_odbc_drivers,
+            get_databases
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

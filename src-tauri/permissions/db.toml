@@ -17,3 +17,13 @@ commands.allow = ["get_tables"]
 identifier = "allow-get-columns"
 description = "Allows fetching column list"
 commands.allow = ["get_columns"]
+
+[[permission]]
+identifier = "allow-get-databases"
+description = "Allows fetching database list"
+commands.allow = ["get_databases"]
+
+[[permission]]
+identifier = "allow-get-odbc-drivers"
+description = "Allows fetching ODBC drivers list"
+commands.allow = ["get_odbc_drivers"]
