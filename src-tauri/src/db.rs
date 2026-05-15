@@ -10,6 +10,21 @@ use std::time::Instant;
 use futures::StreamExt;
 use azure_identity::DefaultAzureCredential;
 use azure_core::auth::TokenCredential;
+#[cfg(windows)]
+use std::sync::OnceLock;
+
+#[cfg(windows)]
+use odbc_api::{Environment, ConnectionOptions, ResultSetMetadata, buffers::TextRowSet};
+
+#[cfg(windows)]
+static ODBC_ENV: OnceLock<Environment> = OnceLock::new();
+
+#[cfg(windows)]
+fn get_odbc_env() -> Result<&'static Environment, String> {
+    ODBC_ENV.get_or_try_init(|| {
+        Environment::new().map_err(|e| e.to_string())
+    })
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub enum DbType {
@@ -114,6 +129,106 @@ async fn get_sqlserver_token() -> Result<String, String> {
         .map_err(|e| format!("Failed to fetch Entra ID token: {}", e))?;
     
     Ok(token_response.token.secret().to_string())
+}
+
+#[cfg(windows)]
+fn build_odbc_connection_string(info: &ConnectionInfo) -> String {
+    let mut parts = Vec::new();
+    
+    // Default to Driver 18 which is common for modern Entra ID support
+    parts.push("Driver={ODBC Driver 18 for SQL Server}".to_string());
+    
+    if !info.host.is_empty() {
+        parts.push(format!("Server={},{}", info.host, info.port));
+    }
+
+    if let Some(db) = &info.database {
+        if !db.trim().is_empty() && !db.contains('=') {
+            parts.push(format!("Database={}", db));
+        }
+    }
+
+    if info.use_entra_id.unwrap_or(false) {
+        parts.push("Authentication=ActiveDirectoryIntegrated".to_string());
+    } else if let Some(user) = &info.user {
+        if !user.trim().is_empty() {
+            parts.push(format!("UID={}", user));
+            parts.push(format!("PWD={}", info.password.as_deref().unwrap_or_default()));
+        } else {
+            parts.push("Trusted_Connection=yes".to_string());
+        }
+    } else {
+        parts.push("Trusted_Connection=yes".to_string());
+    }
+
+    if info.trust_server_certificate.unwrap_or(false) {
+        parts.push("TrustServerCertificate=yes".to_string());
+    }
+
+    if let Some(timeout) = info.connect_timeout {
+        parts.push(format!("ConnectRetryCount=0;Connection Timeout={}", timeout));
+    }
+
+    parts.join(";")
+}
+
+#[cfg(windows)]
+async fn test_connection_odbc(info: ConnectionInfo) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let env = get_odbc_env()?;
+        let conn_str = build_odbc_connection_string(&info);
+        env.connect_with_connection_string(&conn_str, ConnectionOptions::default())
+            .map_err(|e| format!("ODBC Connection failed: {}", e))?;
+        Ok("Connection successful (ODBC)".to_string())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[cfg(windows)]
+async fn execute_query_odbc(info: ConnectionInfo, query: String) -> Result<QueryResult, String> {
+    let start = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        let env = get_odbc_env()?;
+        let conn_str = build_odbc_connection_string(&info);
+        let conn = env.connect_with_connection_string(&conn_str, ConnectionOptions::default())
+            .map_err(|e| format!("ODBC Connection failed: {}", e))?;
+        
+        let cursor = conn.execute(&query, ()).map_err(|e| e.to_string())?;
+        
+        let mut columns = Vec::new();
+        let mut rows = Vec::new();
+        
+        if let Some(mut cursor) = cursor {
+            let num_cols = cursor.num_result_cols().map_err(|e| e.to_string())?;
+            for i in 1..=num_cols {
+                let mut name = String::new();
+                cursor.col_name(i as u16, &mut name).map_err(|e| e.to_string())?;
+                columns.push(name);
+            }
+
+            let mut buffers = TextRowSet::for_cursor(100, &mut cursor, Some(4096)).map_err(|e| e.to_string())?;
+            let mut row_set_cursor = cursor.bind_buffer(&mut buffers).map_err(|e| e.to_string())?;
+            
+            while let Some(batch) = row_set_cursor.fetch().map_err(|e| e.to_string())? {
+                for row_index in 0..batch.num_rows() {
+                    let mut map = serde_json::Map::new();
+                    for col_index in 0..num_cols {
+                        let val = batch.at(col_index as usize, row_index)
+                            .map(|bytes| String::from_utf8_lossy(bytes).trim_end_matches('\0').to_string())
+                            .map(serde_json::Value::String)
+                            .unwrap_or(serde_json::Value::Null);
+                        map.insert(columns[col_index as usize].clone(), val);
+                    }
+                    rows.push(serde_json::Value::Object(map));
+                }
+            }
+        }
+
+        Ok(QueryResult {
+            columns,
+            rows,
+            execution_time_ms: start.elapsed().as_millis(),
+        })
+    }).await.map_err(|e| e.to_string())?
 }
 
 fn build_connection_url(info: &ConnectionInfo) -> String {
@@ -229,6 +344,11 @@ pub async fn test_connection(wrapper: ConnectionWrapper) -> Result<String, Strin
             }
         }
         DbType::Sqlserver => {
+            #[cfg(windows)]
+            if info.use_entra_id.unwrap_or(false) || (info.user.as_deref().unwrap_or("").is_empty() && !info.host.is_empty()) {
+                return test_connection_odbc(info).await;
+            }
+
             let mut config = if !info.host.is_empty() {
                 // Structured config from form
                 let mut c = Config::new();
@@ -458,6 +578,11 @@ pub async fn execute_query(wrapper: ConnectionWrapper, query: String) -> Result<
             })
         }
         DbType::Sqlserver => {
+            #[cfg(windows)]
+            if info.use_entra_id.unwrap_or(false) || (info.user.as_deref().unwrap_or("").is_empty() && !info.host.is_empty()) {
+                return execute_query_odbc(info, query).await;
+            }
+
             let mut client = get_sqlserver_client(&info).await?;
 
             let mut stream = client.query(query, &[]).await.map_err(|e| e.to_string())?;
@@ -549,6 +674,18 @@ pub async fn get_tables(wrapper: ConnectionWrapper) -> Result<Vec<TableInfo>, St
             Ok(collections.into_iter().map(|name| TableInfo { name, schema: None }).collect())
         }
         DbType::Sqlserver => {
+            #[cfg(windows)]
+            if info.use_entra_id.unwrap_or(false) || (info.user.as_deref().unwrap_or("").is_empty() && !info.host.is_empty()) {
+                let res = execute_query_odbc(info, "SELECT TABLE_NAME as [name], TABLE_SCHEMA as [schema] FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'".to_string()).await?;
+                return Ok(res.rows.into_iter().filter_map(|v| {
+                    let obj = v.as_object()?;
+                    Some(TableInfo {
+                        name: obj.get("name")?.as_str()?.to_string(),
+                        schema: obj.get("schema")?.as_str().map(|s| s.to_string()),
+                    })
+                }).collect());
+            }
+
             let mut client = get_sqlserver_client(&info).await?;
             let query = "SELECT TABLE_NAME as [name], TABLE_SCHEMA as [schema] FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'";
             let mut stream = client.query(query, &[]).await.map_err(|e| e.to_string())?;
@@ -634,6 +771,23 @@ pub async fn get_columns(wrapper: ConnectionWrapper, table: String, schema: Opti
             }
         }
         DbType::Sqlserver => {
+            #[cfg(windows)]
+            if info.use_entra_id.unwrap_or(false) || (info.user.as_deref().unwrap_or("").is_empty() && !info.host.is_empty()) {
+                let query = format!(
+                    "SELECT COLUMN_NAME as [name], DATA_TYPE as [data_type] FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}' AND TABLE_SCHEMA = '{}'",
+                    table,
+                    schema.unwrap_or_else(|| "dbo".to_string())
+                );
+                let res = execute_query_odbc(info, query).await?;
+                return Ok(res.rows.into_iter().filter_map(|v| {
+                    let obj = v.as_object()?;
+                    Some(ColumnInfo {
+                        name: obj.get("name")?.as_str()?.to_string(),
+                        data_type: obj.get("data_type")?.as_str()?.to_string(),
+                    })
+                }).collect());
+            }
+
             let mut client = get_sqlserver_client(&info).await?;
             let query = format!(
                 "SELECT COLUMN_NAME as [name], DATA_TYPE as [data_type] FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}' AND TABLE_SCHEMA = '{}'",

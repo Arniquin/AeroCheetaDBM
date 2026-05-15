@@ -33,3 +33,5 @@ tokio-util = { version = "0.7", features = ["compat"] }
 azure_identity = "0.21"
 azure_core = "0.21"
 
+[target.'cfg(windows)'.dependencies]
+odbc-api = "25"
