@@ -14,19 +14,22 @@ use azure_core::auth::TokenCredential;
 use std::sync::OnceLock;
 
 #[cfg(windows)]
-use odbc_api::{Environment, ConnectionOptions, ResultSetMetadata, buffers::TextRowSet};
+use odbc_api::{Environment, ConnectionOptions, ResultSetMetadata, Cursor, buffers::TextRowSet};
 
 #[cfg(windows)]
 static ODBC_ENV: OnceLock<Environment> = OnceLock::new();
 
 #[cfg(windows)]
 fn get_odbc_env() -> Result<&'static Environment, String> {
-    ODBC_ENV.get_or_try_init(|| {
-        Environment::new().map_err(|e| e.to_string())
-    })
+    if let Some(env) = ODBC_ENV.get() {
+        return Ok(env);
+    }
+    let env = Environment::new().map_err(|e| e.to_string())?;
+    let _ = ODBC_ENV.set(env);
+    Ok(ODBC_ENV.get().expect("Environment should be set"))
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub enum DbType {
     #[serde(rename = "postgres")]
     Postgres,
@@ -64,12 +67,65 @@ pub struct QueryResult {
 pub struct TableInfo {
     pub name: String,
     pub schema: Option<String>,
+    pub database: Option<String>,
+}
+
+pub async fn get_databases(wrapper: ConnectionWrapper) -> Result<Vec<String>, String> {
+    let info = wrapper.get_info()?;
+    match info.db_type {
+        DbType::Mock => Ok(vec!["demo_db".to_string(), "test_db".to_string()]),
+        DbType::Postgres => {
+            let query = "SELECT datname FROM pg_database WHERE datistemplate = false";
+            let res = execute_query(wrapper, query.to_string()).await?;
+            Ok(res.rows.into_iter().filter_map(|v| {
+                v.as_object()?.get("datname")?.as_str().map(|s| s.to_string())
+            }).collect())
+        }
+        DbType::Mysql => {
+            let query = "SHOW DATABASES";
+            let res = execute_query(wrapper, query.to_string()).await?;
+            Ok(res.rows.into_iter().filter_map(|v| {
+                v.as_object()?.get("Database")?.as_str().map(|s| s.to_string())
+            }).collect())
+        }
+        DbType::Mongodb => {
+            let info = wrapper.get_info()?;
+            let url = build_connection_url(&info);
+            let client = Client::with_uri_str(&url).await.map_err(|e| e.to_string())?;
+            let db_names = client.list_database_names().await.map_err(|e| e.to_string())?;
+            Ok(db_names)
+        }
+        DbType::Sqlserver => {
+            #[cfg(windows)]
+            if info.use_entra_id.unwrap_or(false) || (info.user.as_deref().unwrap_or("").is_empty() && !info.host.is_empty()) {
+                let res = execute_query_odbc(info, "SELECT name FROM sys.databases WHERE state = 0".to_string()).await?;
+                return Ok(res.rows.into_iter().filter_map(|v| {
+                    v.as_object()?.get("name")?.as_str().map(|s| s.to_string())
+                }).collect());
+            }
+
+            let mut client = get_sqlserver_client(&info).await?;
+            let mut stream = client.query("SELECT name FROM sys.databases WHERE state = 0", &[]).await.map_err(|e| e.to_string())?;
+            let mut results = Vec::new();
+            while let Some(item) = stream.next().await {
+                if let Ok(tiberius::QueryItem::Row(row)) = item {
+                    if let Some(s) = row.try_get::<&str, _>(0).unwrap_or(None) {
+                        results.push(s.to_string());
+                    }
+                }
+            }
+            Ok(results)
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
+    pub is_nullable: Option<bool>,
+    pub default_value: Option<String>,
+    pub max_length: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -95,7 +151,7 @@ impl ConnectionWrapper {
                     Ok(ConnectionInfo { db_type: DbType::Mysql, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None, trust_server_certificate: Some(trust_server_certificate), connect_timeout: None })
                 } else if s.starts_with("mongodb://") {
                     Ok(ConnectionInfo { db_type: DbType::Mongodb, host: "".to_string(), port: 0, user: None, password: None, database: Some(s.clone()), use_entra_id: None, trust_server_certificate: Some(trust_server_certificate), connect_timeout: None })
-                } else if s.starts_with("sqlserver://") || s_lower.contains("initial catalog=") {
+                } else if s.starts_with("sqlserver://") || s_lower.contains("initial catalog=") || s_lower.contains("database=") || s_lower.contains("server=") {
                     let use_entra_id = s_lower.contains("authentication=activedirectoryintegrated") 
                                     || s_lower.contains("authentication=activedirectorymsi")
                                     || s_lower.contains("authentication=activedirectorydefault");
@@ -132,24 +188,103 @@ async fn get_sqlserver_token() -> Result<String, String> {
 }
 
 #[cfg(windows)]
-fn build_odbc_connection_string(info: &ConnectionInfo) -> String {
-    let mut parts = Vec::new();
-    
-    // Default to Driver 18 which is common for modern Entra ID support
-    parts.push("Driver={ODBC Driver 18 for SQL Server}".to_string());
-    
-    if !info.host.is_empty() {
-        parts.push(format!("Server={},{}", info.host, info.port));
+pub fn get_odbc_drivers() -> Result<Vec<String>, String> {
+    let env = get_odbc_env()?;
+    let drivers = env.drivers().map_err(|e| e.to_string())?;
+    Ok(drivers.into_iter().map(|d| d.description).collect())
+}
+
+#[cfg(not(windows))]
+pub fn get_odbc_drivers() -> Result<Vec<String>, String> {
+    Ok(vec![])
+}
+
+#[cfg(windows)]
+fn get_best_sql_server_driver() -> Option<String> {
+    let env = get_odbc_env().ok()?;
+
+    // Check for modern drivers first
+    let modern_drivers = [
+        "ODBC Driver 18 for SQL Server",
+        "ODBC Driver 17 for SQL Server",
+        "ODBC Driver 13 for SQL Server",
+        "ODBC Driver 11 for SQL Server",
+    ];
+
+    // Note: data_sources() returns DSNs, not drivers. 
+    // To get drivers, we should use env.drivers()
+    if let Ok(drivers_list) = env.drivers() {
+        for driver_info in drivers_list {
+            for &modern in &modern_drivers {
+                if driver_info.description.contains(modern) {
+                    return Some(modern.to_string());
+                }
+            }
+        }
     }
 
+    // Fallback to legacy if nothing else found
+    if let Ok(drivers_list) = env.drivers() {
+        for driver_info in drivers_list {
+            if driver_info.description.contains("SQL Server") {
+                return Some("SQL Server".to_string());
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn build_odbc_connection_string(info: &ConnectionInfo) -> Result<String, String> {
+    let driver = get_best_sql_server_driver().ok_or_else(|| "No SQL Server ODBC driver found on this system. Please install the Microsoft ODBC Driver for SQL Server.".to_string())?;
+    
+    let mut parts = Vec::new();
+    
+    if info.host.is_empty() {
+        // Connection string mode
+        let mut conn_str = info.database.clone().unwrap_or_default();
+        
+        // Ensure Driver is present
+        if !conn_str.to_lowercase().contains("driver=") {
+            conn_str = format!("Driver={{{}}};{}", driver, conn_str);
+        }
+        
+        // Ensure Encrypt=yes if Entra ID is used
+        if info.use_entra_id.unwrap_or(false) && !conn_str.to_lowercase().contains("encrypt=") {
+            if !conn_str.ends_with(';') && !conn_str.is_empty() {
+                conn_str.push(';');
+            }
+            conn_str.push_str("Encrypt=yes");
+        }
+
+        // Ensure Authentication=ActiveDirectoryIntegrated if Entra ID is used and no authentication is specified
+        if info.use_entra_id.unwrap_or(false) && !conn_str.to_lowercase().contains("authentication=") {
+            if !conn_str.ends_with(';') && !conn_str.is_empty() {
+                conn_str.push(';');
+            }
+            conn_str.push_str("Authentication=ActiveDirectoryIntegrated");
+        }
+        
+        return Ok(conn_str);
+    }
+
+    // Structured mode
+    parts.push(format!("Driver={{{}}}", driver));
+    parts.push(format!("Server={},{}", info.host, info.port));
+
     if let Some(db) = &info.database {
-        if !db.trim().is_empty() && !db.contains('=') {
+        if !db.trim().is_empty() {
             parts.push(format!("Database={}", db));
         }
     }
 
     if info.use_entra_id.unwrap_or(false) {
+        if driver == "SQL Server" {
+            return Err("Entra ID authentication requires a modern ODBC driver (v13.1, v17, or v18). Only the legacy 'SQL Server' driver was found.".to_string());
+        }
         parts.push("Authentication=ActiveDirectoryIntegrated".to_string());
+        parts.push("Encrypt=yes".to_string()); // Mandatory for Azure/Entra ID
     } else if let Some(user) = &info.user {
         if !user.trim().is_empty() {
             parts.push(format!("UID={}", user));
@@ -169,14 +304,14 @@ fn build_odbc_connection_string(info: &ConnectionInfo) -> String {
         parts.push(format!("ConnectRetryCount=0;Connection Timeout={}", timeout));
     }
 
-    parts.join(";")
+    Ok(parts.join(";"))
 }
 
 #[cfg(windows)]
 async fn test_connection_odbc(info: ConnectionInfo) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
         let env = get_odbc_env()?;
-        let conn_str = build_odbc_connection_string(&info);
+        let conn_str = build_odbc_connection_string(&info)?;
         env.connect_with_connection_string(&conn_str, ConnectionOptions::default())
             .map_err(|e| format!("ODBC Connection failed: {}", e))?;
         Ok("Connection successful (ODBC)".to_string())
@@ -188,11 +323,11 @@ async fn execute_query_odbc(info: ConnectionInfo, query: String) -> Result<Query
     let start = Instant::now();
     tokio::task::spawn_blocking(move || {
         let env = get_odbc_env()?;
-        let conn_str = build_odbc_connection_string(&info);
+        let conn_str = build_odbc_connection_string(&info)?;
         let conn = env.connect_with_connection_string(&conn_str, ConnectionOptions::default())
             .map_err(|e| format!("ODBC Connection failed: {}", e))?;
         
-        let cursor = conn.execute(&query, ()).map_err(|e| e.to_string())?;
+        let cursor = conn.execute(&query, (), None).map_err(|e| e.to_string())?;
         
         let mut columns = Vec::new();
         let mut rows = Vec::new();
@@ -200,8 +335,7 @@ async fn execute_query_odbc(info: ConnectionInfo, query: String) -> Result<Query
         if let Some(mut cursor) = cursor {
             let num_cols = cursor.num_result_cols().map_err(|e| e.to_string())?;
             for i in 1..=num_cols {
-                let mut name = String::new();
-                cursor.col_name(i as u16, &mut name).map_err(|e| e.to_string())?;
+                let name = cursor.col_name(i as u16).map_err(|e| e.to_string())?;
                 columns.push(name);
             }
 
@@ -635,29 +769,31 @@ pub async fn get_tables(wrapper: ConnectionWrapper) -> Result<Vec<TableInfo>, St
     match info.db_type {
         DbType::Mock => {
             Ok(vec![
-                TableInfo { name: "users".to_string(), schema: Some("public".to_string()) },
-                TableInfo { name: "products".to_string(), schema: Some("public".to_string()) },
+                TableInfo { name: "users".to_string(), schema: Some("public".to_string()), database: Some("demo_db".to_string()) },
+                TableInfo { name: "products".to_string(), schema: Some("public".to_string()), database: Some("demo_db".to_string()) },
             ])
         }
         DbType::Postgres => {
-            let query = "SELECT table_name as name, table_schema as schema FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog')";
+            let query = "SELECT table_name as name, table_schema as schema, current_database() as database FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog')";
             let res = execute_query(wrapper, query.to_string()).await?;
             Ok(res.rows.into_iter().filter_map(|v| {
                 let obj = v.as_object()?;
                 Some(TableInfo {
                     name: obj.get("name")?.as_str()?.to_string(),
                     schema: obj.get("schema")?.as_str().map(|s| s.to_string()),
+                    database: obj.get("database")?.as_str().map(|s| s.to_string()),
                 })
             }).collect())
         }
         DbType::Mysql => {
-            let query = "SELECT table_name as name FROM information_schema.tables WHERE table_schema = DATABASE()";
+            let query = "SELECT table_name as name, DATABASE() as database FROM information_schema.tables WHERE table_schema = DATABASE()";
             let res = execute_query(wrapper, query.to_string()).await?;
             Ok(res.rows.into_iter().filter_map(|v| {
                 let obj = v.as_object()?;
                 Some(TableInfo {
                     name: obj.get("name")?.as_str()?.to_string(),
                     schema: None,
+                    database: obj.get("database")?.as_str().map(|s| s.to_string()),
                 })
             }).collect())
         }
@@ -671,23 +807,24 @@ pub async fn get_tables(wrapper: ConnectionWrapper) -> Result<Vec<TableInfo>, St
             };
             let db = client.database(db_name);
             let collections = db.list_collection_names().await.map_err(|e| e.to_string())?;
-            Ok(collections.into_iter().map(|name| TableInfo { name, schema: None }).collect())
+            Ok(collections.into_iter().map(|name| TableInfo { name, schema: None, database: Some(db_name.to_string()) }).collect())
         }
         DbType::Sqlserver => {
             #[cfg(windows)]
             if info.use_entra_id.unwrap_or(false) || (info.user.as_deref().unwrap_or("").is_empty() && !info.host.is_empty()) {
-                let res = execute_query_odbc(info, "SELECT TABLE_NAME as [name], TABLE_SCHEMA as [schema] FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'".to_string()).await?;
+                let res = execute_query_odbc(info, "SELECT TABLE_NAME as [name], TABLE_SCHEMA as [schema], DB_NAME() as [database] FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'".to_string()).await?;
                 return Ok(res.rows.into_iter().filter_map(|v| {
                     let obj = v.as_object()?;
                     Some(TableInfo {
                         name: obj.get("name")?.as_str()?.to_string(),
                         schema: obj.get("schema")?.as_str().map(|s| s.to_string()),
+                        database: obj.get("database")?.as_str().map(|s| s.to_string()),
                     })
                 }).collect());
             }
 
             let mut client = get_sqlserver_client(&info).await?;
-            let query = "SELECT TABLE_NAME as [name], TABLE_SCHEMA as [schema] FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'";
+            let query = "SELECT TABLE_NAME as [name], TABLE_SCHEMA as [schema], DB_NAME() as [database] FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'";
             let mut stream = client.query(query, &[]).await.map_err(|e| e.to_string())?;
             
             let mut results = Vec::new();
@@ -697,6 +834,7 @@ pub async fn get_tables(wrapper: ConnectionWrapper) -> Result<Vec<TableInfo>, St
                         results.push(TableInfo {
                             name: row.try_get::<&str, _>(0).unwrap_or(Some("")).unwrap_or("").to_string(),
                             schema: row.try_get::<&str, _>(1).unwrap_or(None).map(|s| s.to_string()),
+                            database: row.try_get::<&str, _>(2).unwrap_or(None).map(|s| s.to_string()),
                         });
                     }
                     _ => {}
@@ -713,21 +851,23 @@ pub async fn get_columns(wrapper: ConnectionWrapper, table: String, schema: Opti
         DbType::Mock => {
             if table == "users" {
                 Ok(vec![
-                    ColumnInfo { name: "id".to_string(), data_type: "integer".to_string() },
-                    ColumnInfo { name: "name".to_string(), data_type: "varchar".to_string() },
-                    ColumnInfo { name: "email".to_string(), data_type: "varchar".to_string() },
+                    ColumnInfo { name: "id".to_string(), data_type: "integer".to_string(), is_nullable: Some(false), default_value: None, max_length: None },
+                    ColumnInfo { name: "name".to_string(), data_type: "varchar".to_string(), is_nullable: Some(false), default_value: None, max_length: Some(100) },
+                    ColumnInfo { name: "email".to_string(), data_type: "varchar".to_string(), is_nullable: Some(true), default_value: None, max_length: Some(255) },
                 ])
             } else {
                 Ok(vec![
-                    ColumnInfo { name: "id".to_string(), data_type: "integer".to_string() },
-                    ColumnInfo { name: "title".to_string(), data_type: "varchar".to_string() },
-                    ColumnInfo { name: "price".to_string(), data_type: "numeric".to_string() },
+                    ColumnInfo { name: "id".to_string(), data_type: "integer".to_string(), is_nullable: Some(false), default_value: None, max_length: None },
+                    ColumnInfo { name: "title".to_string(), data_type: "varchar".to_string(), is_nullable: Some(false), default_value: None, max_length: Some(200) },
+                    ColumnInfo { name: "price".to_string(), data_type: "numeric".to_string(), is_nullable: Some(false), default_value: Some("0.0".to_string()), max_length: None },
                 ])
             }
         }
         DbType::Postgres => {
             let query = format!(
-                "SELECT column_name as name, data_type FROM information_schema.columns WHERE table_name = '{}' AND table_schema = '{}'",
+                "SELECT column_name as name, data_type, is_nullable, column_default as default_value, character_maximum_length as max_length 
+                 FROM information_schema.columns 
+                 WHERE table_name = '{}' AND table_schema = '{}'",
                 table,
                 schema.unwrap_or_else(|| "public".to_string())
             );
@@ -737,12 +877,17 @@ pub async fn get_columns(wrapper: ConnectionWrapper, table: String, schema: Opti
                 Some(ColumnInfo {
                     name: obj.get("name")?.as_str()?.to_string(),
                     data_type: obj.get("data_type")?.as_str()?.to_string(),
+                    is_nullable: obj.get("is_nullable").and_then(|v| v.as_str()).map(|s| s == "YES"),
+                    default_value: obj.get("default_value").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    max_length: obj.get("max_length").and_then(|v| v.as_i64()).map(|n| n as i32),
                 })
             }).collect())
         }
         DbType::Mysql => {
             let query = format!(
-                "SELECT column_name as name, data_type FROM information_schema.columns WHERE table_name = '{}' AND table_schema = DATABASE()",
+                "SELECT column_name as name, data_type, is_nullable, column_default as default_value, character_maximum_length as max_length 
+                 FROM information_schema.columns 
+                 WHERE table_name = '{}' AND table_schema = DATABASE()",
                 table
             );
             let res = execute_query(wrapper, query).await?;
@@ -751,6 +896,9 @@ pub async fn get_columns(wrapper: ConnectionWrapper, table: String, schema: Opti
                 Some(ColumnInfo {
                     name: obj.get("name")?.as_str()?.to_string(),
                     data_type: obj.get("data_type")?.as_str()?.to_string(),
+                    is_nullable: obj.get("is_nullable").and_then(|v| v.as_str()).map(|s| s == "YES"),
+                    default_value: obj.get("default_value").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    max_length: obj.get("max_length").and_then(|v| v.as_i64()).map(|n| n as i32),
                 })
             }).collect())
         }
@@ -765,35 +913,36 @@ pub async fn get_columns(wrapper: ConnectionWrapper, table: String, schema: Opti
             let db = client.database(db_name);
             let collection = db.collection::<Document>(&table);
             if let Some(doc) = collection.find_one(doc! {}).await.map_err(|e| e.to_string())? {
-                Ok(doc.keys().map(|k| ColumnInfo { name: k.clone(), data_type: "dynamic".to_string() }).collect())
+                Ok(doc.keys().map(|k| ColumnInfo { name: k.clone(), data_type: "dynamic".to_string(), is_nullable: Some(true), default_value: None, max_length: None }).collect())
             } else {
                 Ok(vec![])
             }
         }
         DbType::Sqlserver => {
+            let query = format!(
+                "SELECT COLUMN_NAME as [name], DATA_TYPE as [data_type], IS_NULLABLE as [is_nullable], COLUMN_DEFAULT as [default_value], CHARACTER_MAXIMUM_LENGTH as [max_length] 
+                 FROM INFORMATION_SCHEMA.COLUMNS 
+                 WHERE TABLE_NAME = '{}' AND TABLE_SCHEMA = '{}'",
+                table,
+                schema.unwrap_or_else(|| "dbo".to_string())
+            );
+            
             #[cfg(windows)]
             if info.use_entra_id.unwrap_or(false) || (info.user.as_deref().unwrap_or("").is_empty() && !info.host.is_empty()) {
-                let query = format!(
-                    "SELECT COLUMN_NAME as [name], DATA_TYPE as [data_type] FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}' AND TABLE_SCHEMA = '{}'",
-                    table,
-                    schema.unwrap_or_else(|| "dbo".to_string())
-                );
                 let res = execute_query_odbc(info, query).await?;
                 return Ok(res.rows.into_iter().filter_map(|v| {
                     let obj = v.as_object()?;
                     Some(ColumnInfo {
                         name: obj.get("name")?.as_str()?.to_string(),
                         data_type: obj.get("data_type")?.as_str()?.to_string(),
+                        is_nullable: obj.get("is_nullable").and_then(|v| v.as_str()).map(|s| s == "YES"),
+                        default_value: obj.get("default_value").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        max_length: obj.get("max_length").and_then(|v| v.as_i64()).or_else(|| obj.get("max_length").and_then(|v| v.as_str().and_then(|s| s.parse::<i64>().ok()))).map(|n| n as i32),
                     })
                 }).collect());
             }
 
             let mut client = get_sqlserver_client(&info).await?;
-            let query = format!(
-                "SELECT COLUMN_NAME as [name], DATA_TYPE as [data_type] FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}' AND TABLE_SCHEMA = '{}'",
-                table,
-                schema.unwrap_or_else(|| "dbo".to_string())
-            );
             let mut stream = client.query(query, &[]).await.map_err(|e| e.to_string())?;
             
             let mut results = Vec::new();
@@ -803,6 +952,9 @@ pub async fn get_columns(wrapper: ConnectionWrapper, table: String, schema: Opti
                         results.push(ColumnInfo {
                             name: row.try_get::<&str, _>(0).unwrap_or(Some("")).unwrap_or("").to_string(),
                             data_type: row.try_get::<&str, _>(1).unwrap_or(Some("")).unwrap_or("").to_string(),
+                            is_nullable: row.try_get::<&str, _>(2).unwrap_or(Some("")).map(|s| s == "YES"),
+                            default_value: row.try_get::<&str, _>(3).unwrap_or(None).map(|s| s.to_string()),
+                            max_length: row.try_get::<i32, _>(4).unwrap_or(None),
                         });
                     }
                     _ => {}

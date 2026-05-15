@@ -16,6 +16,8 @@
     "allow-test-connection",
     "allow-execute-query",
     "allow-get-tables",
-    "allow-get-columns"
+    "allow-get-columns",
+    "allow-get-databases",
+    "allow-get-odbc-drivers"
   ]
 }

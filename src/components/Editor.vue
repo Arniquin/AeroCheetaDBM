@@ -25,13 +25,32 @@ const activeFile = computed(() =>
 );
 
 const currentConnectionId = computed(() => {
+  if (dbStore.connectionStatus !== 'connected') return '';
+  
+  // 1. Try matching by alias first (most reliable if using saved connections)
+  if (dbStore.currentAlias) {
+    const byAlias = dbStore.savedConnections.find(c => c.alias === dbStore.currentAlias);
+    if (byAlias) return byAlias.id;
+  }
+
+  // 2. Try matching by core properties (fallback for desynced aliases)
   const active = dbStore.savedConnections.find(c => {
     if (typeof c.info === 'string') {
       return c.info === dbStore.connectionString;
     }
-    return JSON.stringify(c.info) === JSON.stringify(dbStore.currentConnection);
+    
+    const curr = dbStore.currentConnection;
+    if (!curr || typeof c.info !== 'object') return false;
+    
+    // Compare core fields, ignoring connect_timeout which is injected at runtime
+    return c.info.db_type === curr.db_type &&
+           c.info.host === curr.host &&
+           c.info.port === curr.port &&
+           c.info.user === curr.user &&
+           c.info.database === curr.database;
   });
-  return active ? active.id : '';
+
+  return active ? active.id : 'temp';
 });
 
 async function handleConnectionChange(event: Event) {
@@ -227,6 +246,7 @@ async function openFile() {
           <Database :size="14" />
           <select :value="currentConnectionId" @change="handleConnectionChange" class="conn-select">
             <option value="" disabled>No Connection</option>
+            <option v-if="currentConnectionId === 'temp'" value="temp">Active (Unsaved)</option>
             <option v-for="conn in dbStore.savedConnections" :key="conn.id" :value="conn.id">
               {{ conn.alias }}
             </option>
